@@ -1,5 +1,5 @@
-# PC WHY? - No Internet diagnostic + DNS repair prototype
-# Repairs are intentionally limited to a confirmed DNS-failure path.
+# PC WHY? - No Internet diagnostic + safe repair prototype
+# Repairs are intentionally limited to confirmed DNS and DHCP/IP failure paths.
 
 $ErrorActionPreference = 'SilentlyContinue'
 $results = @()
@@ -47,6 +47,82 @@ function Finish-Diagnostic([int]$code, [string]$summary) {
 function Test-DnsNow {
     $dns = Resolve-DnsName -Name 'www.microsoft.com' -Type A -DnsOnly
     return ($null -ne $dns)
+}
+
+function Get-ValidIPv4([int]$interfaceIndex) {
+    $cfg = Get-NetIPConfiguration -InterfaceIndex $interfaceIndex
+    $ip = $cfg.IPv4Address | Select-Object -First 1
+    if (-not $ip) { return $null }
+    if ($ip.IPAddress -like '169.254.*') { return $null }
+    return $ip.IPAddress
+}
+
+function Repair-DhcpIp([string]$interfaceAlias, [int]$interfaceIndex) {
+    $ipInterface = Get-NetIPInterface -InterfaceIndex $interfaceIndex -AddressFamily IPv4
+
+    # Never overwrite a static-IP configuration automatically.
+    if (-not $ipInterface -or $ipInterface.Dhcp -ne 'Enabled') {
+        $script:results += Result 'DHCP repair' 'STOP' 'IPv4 DHCP is not enabled. PC WHY? will not overwrite a static/manual IP configuration.'
+        Finish-Diagnostic 21 'IP configuration is invalid, but this adapter is not using DHCP. Automatic repair was stopped to avoid changing a manual network setup.'
+    }
+
+    Write-Host ''
+    Write-Host '------------------------------------------------------------' -ForegroundColor DarkCyan
+    Write-Host 'PC WHY? - PROPOSED DHCP/IP FIX' -ForegroundColor Cyan
+    Write-Host '------------------------------------------------------------' -ForegroundColor DarkCyan
+    Write-Host 'Detected: This adapter is using DHCP, but it has no valid IPv4 address.'
+    Write-Host ''
+    Write-Host 'PC WHY? will:' -ForegroundColor White
+    Write-Host '  1. Ask Windows DHCP to renew the IPv4 lease for this adapter.'
+    Write-Host '  2. Wait briefly for a new address.'
+    Write-Host '  3. Verify that a non-APIPA IPv4 address was assigned.'
+    Write-Host ''
+    Write-Host 'PC WHY? will NOT:' -ForegroundColor White
+    Write-Host '  - Change a static/manual IP configuration'
+    Write-Host '  - Replace network drivers'
+    Write-Host '  - Modify unrelated Registry settings'
+    Write-Host '  - Delete personal files'
+    Write-Host ''
+    Write-Host 'Risk: LOW (network may disconnect briefly)' -ForegroundColor Green
+    Write-Host ''
+
+    $choice = Read-Host 'Apply this fix? [Y/N]'
+    if ($choice -notmatch '^[Yy]$') {
+        Finish-Diagnostic 20 'DHCP/IP failure confirmed. User declined repair.'
+    }
+
+    Write-Host ''
+    Write-Host 'Requesting a fresh DHCP lease...' -ForegroundColor Cyan
+
+    # Use Windows' DHCP lease renewal method on the matching interface.
+    $nicConfig = Get-CimInstance Win32_NetworkAdapterConfiguration | Where-Object { $_.InterfaceIndex -eq $interfaceIndex } | Select-Object -First 1
+    if ($nicConfig) {
+        Invoke-CimMethod -InputObject $nicConfig -MethodName RenewDHCPLease | Out-Null
+    }
+
+    Start-Sleep -Seconds 5
+    Write-Host 'Verifying...' -ForegroundColor Cyan
+
+    $newIp = Get-ValidIPv4 $interfaceIndex
+    if ($newIp) {
+        $script:results += Result 'DHCP repair' 'FIXED' ("Valid IPv4 assigned after DHCP renewal: {0}" -f $newIp)
+        Show-Results 'FIXED: Windows received a valid IPv4 address again.' 'Green'
+        $reportPath = Save-Report 'FIXED: DHCP renewal restored a valid IPv4 address.'
+        Write-Host ''
+        Write-Host ('Report saved to: ' + $reportPath) -ForegroundColor Green
+        Write-Host ''
+        Read-Host 'Press ENTER to close'
+        exit 0
+    }
+
+    $script:results += Result 'DHCP repair' 'FAIL' 'No valid IPv4 address was obtained after the safe DHCP renewal attempt.'
+    Show-Results 'NOT FIXED: Windows still has no valid IPv4 address. PC WHY? stopped instead of making broader network changes.' 'Red'
+    $reportPath = Save-Report 'NOT FIXED: DHCP renewal did not restore a valid IPv4 address.'
+    Write-Host ''
+    Write-Host ('Report saved to: ' + $reportPath) -ForegroundColor Green
+    Write-Host ''
+    Read-Host 'Press ENTER to close'
+    exit 22
 }
 
 function Repair-Dns([string]$interfaceAlias) {
@@ -116,7 +192,8 @@ $ipv4 = $config.IPv4Address | Select-Object -First 1
 if (-not $ipv4 -or $ipv4.IPAddress -like '169.254.*') {
     $detail = if ($ipv4) { "Invalid/APIPA IPv4 address: $($ipv4.IPAddress)" } else { 'No IPv4 address assigned.' }
     $results += Result 'IP configuration' 'FAIL' $detail
-    Finish-Diagnostic 20 'Likely fault: IPv4 configuration / DHCP.'
+    Show-Results 'Likely fault: IPv4 configuration / DHCP.'
+    Repair-DhcpIp $adapter.Name $adapter.ifIndex
 }
 $results += Result 'IP configuration' 'PASS' ("IPv4: {0}" -f $ipv4.IPAddress)
 
